@@ -1,0 +1,8 @@
+{
+  "name": "forexfactory-bot",
+  "version": "1.0.0",
+  "main": "forexfactory-bot.js",
+  "scripts": {
+    "start": "node forexfactory-bot.js"
+  }
+}
