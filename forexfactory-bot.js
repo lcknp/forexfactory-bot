@@ -1,146 +1,243 @@
-// ===============================
-// ForexFactory USD High-Impact News -> Telegram Bot
-// Für Render.com (24/7 Betrieb) mit Auto-Cooldown bei 429
-// ===============================
+import os
+import time
+import logging
+from typing import List, Dict, Any
+from datetime import datetime, timezone
 
-// --- Konfiguration über Environment Variablen ---
-// Diese musst du in Render setzen:
-// TELEGRAM_TOKEN   = dein Bot-Token
-// TELEGRAM_CHAT_ID = deine Chat-ID
+import requests
 
-const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
-const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
+# ======================================================
+#                 KONFIGURATION
+# ======================================================
 
-if (!TELEGRAM_TOKEN || !TELEGRAM_CHAT_ID) {
-  console.error("❌ TELEGRAM_TOKEN oder TELEGRAM_CHAT_ID ist nicht gesetzt!");
-  process.exit(1);
-}
+# Discord-Webhook aus Replit-Secret lesen
+DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL")
 
-// ForexFactory JSON dieser Woche
-const FF_URL = "https://nfs.faireconomy.media/ff_calendar_thisweek.json";
+print("DEBUG DISCORD_WEBHOOK_URL:", repr(DISCORD_WEBHOOK_URL))
 
-// Standard-Abfrageintervall (z.B. 1 Minute)
-const BASE_POLL_INTERVAL_MS = 60 * 1000;
+if DISCORD_WEBHOOK_URL is None or DISCORD_WEBHOOK_URL.strip() == "":
+    raise SystemExit("❌ Environment-Variable DISCORD_WEBHOOK_URL ist nicht gesetzt!")
 
-// Cooldown, wenn 429 (Too Many Requests) auftritt (z.B. 5 Minuten)
-const COOLDOWN_INTERVAL_MS = 5 * 60 * 1000;
+# ForexFactory JSON dieser Woche
+FF_URL = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
 
-// Merkt sich Events, die schon gesendet wurden
-const sentEvents = new Set();
+# Polling-Intervalle
+BASE_POLL_INTERVAL = 60          # Sekunden (Standard)
+MAX_POLL_INTERVAL = 15 * 60      # Max. Wartezeit bei Backoff
 
-/**
- * Telegram Nachricht senden
- */
-async function sendTelegramMessage(text) {
-  const url = `https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`;
+# Logging einstellen
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+logger = logging.getLogger(__name__)
 
-  const resp = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      chat_id: TELEGRAM_CHAT_ID,
-      text,
-      parse_mode: "HTML",
-    }),
-  });
+# Merkt sich in dieser Laufzeit bereits gesendete Events
+sent_events: set[str] = set()
 
-  const data = await resp.json();
-  if (!data.ok) {
-    console.error("❌ Telegram-Fehler:", data);
-  } else {
-    console.log("📨 Nachricht gesendet:", text.split("\n")[0]);
-  }
-}
+# HTTP-Session wiederverwenden (effizienter als jedes Mal neue Verbindung)
+session = requests.Session()
 
-/**
- * ForexFactory-Kalender laden
- */
-async function fetchCalendar() {
-  const resp = await fetch(FF_URL);
 
-  if (resp.status === 429) {
-    // Rate Limit
-    throw new Error("RATE_LIMIT_429");
-  }
+# ======================================================
+#                 HILFSKLASSEN
+# ======================================================
 
-  if (!resp.ok) {
-    throw new Error(`HTTP_${resp.status}`);
-  }
+class RateLimitError(Exception):
+    """Wird geworfen, wenn ForexFactory 429 zurückgibt."""
 
-  const data = await resp.json();
-  return data;
-}
+    def __init__(self, message: str, retry_after: int | None = None):
+        super().__init__(message)
+        self.retry_after = retry_after
 
-/**
- * USD High-Impact News prüfen & senden
- */
-async function checkUsdNews() {
-  console.log("🔎 Prüfe USD High-Impact News ...");
 
-  const events = await fetchCalendar();
-  const now = new Date();
+# ======================================================
+#                 HILFSFUNKTIONEN
+# ======================================================
 
-  // Filtere nur USD + High Impact
-  const usdHighImpact = events.filter((e) => {
-    if (e.country !== "USD") return false;
+def send_discord_message(content: str) -> None:
+    """Sendet eine Nachricht an den Discord-Webhook."""
+    data = {"content": content}
 
-    // Impact als String normalisieren
-    const impact = String(e.impact).toLowerCase();
-    // Je nach API: "High", "high", oder Zahl "3"
-    return impact === "high" || impact === "3";
-  });
+    try:
+        resp = session.post(DISCORD_WEBHOOK_URL, json=data, timeout=10)
+    except Exception as e:
+        logger.error("Fehler beim Senden an Discord: %s", e)
+        return
 
-  for (const event of usdHighImpact) {
-    const eventTime = new Date(event.date);
-    const key = `${event.country}|${event.title}|${event.date}`;
+    if resp.status_code >= 400:
+        logger.error(
+            "Discord-Webhooks-Fehler: %s %s - %s",
+            resp.status_code,
+            resp.reason,
+            resp.text[:200],
+        )
+    else:
+        logger.info("📨 An Discord gesendet: %s", content.split("\n", 1)[0])
 
-    // Nur senden, wenn die Zeit erreicht/vergangen ist und wir es noch nicht geschickt haben
-    if (eventTime <= now && !sentEvents.has(key)) {
-      sentEvents.add(key);
 
-      let text = `📣 <b>USD News (High Impact)</b>\n`;
-      text += `<b>${event.title}</b>\n`;
-      text += `🕒 Zeit (UTC): ${eventTime.toISOString()}\n`;
-      text += `📊 Impact: ${event.impact}\n`;
+def fetch_calendar() -> List[Dict[str, Any]]:
+    """Holt das ForexFactory-JSON."""
+    try:
+        resp = session.get(FF_URL, timeout=10)
+    except Exception as e:
+        logger.error("Fehler beim HTTP-Request an ForexFactory: %s", e)
+        raise
 
-      if (event.forecast) text += `🔮 Forecast: ${event.forecast}\n`;
-      if (event.previous) text += `📁 Previous: ${event.previous}\n`;
+    if resp.status_code == 429:
+        # Falls "Retry-After" Header vorhanden ist, nutzen wir den
+        retry_after_header = resp.headers.get("Retry-After")
+        retry_after = None
+        if retry_after_header and retry_after_header.isdigit():
+            retry_after = int(retry_after_header)
 
-      await sendTelegramMessage(text);
-    }
-  }
+        raise RateLimitError("429 Too Many Requests", retry_after=retry_after)
 
-  console.log("✅ High-Impact-Check abgeschlossen.");
-}
+    if resp.status_code >= 400:
+        raise RuntimeError(
+            f"HTTP-Fehler von ForexFactory: {resp.status_code} {resp.text[:200]}"
+        )
 
-/**
- * Sicherer Loop mit flexiblem Intervall (Auto-Cooldown bei 429)
- */
-let currentInterval = BASE_POLL_INTERVAL_MS;
+    try:
+        return resp.json()
+    except Exception as e:
+        raise RuntimeError(
+            f"Fehler beim Parsen des ForexFactory-JSON: {e}"
+        ) from e
 
-async function loop() {
-  try {
-    await checkUsdNews();
-    // Wenn es geklappt hat → wieder normales Intervall
-    if (currentInterval !== BASE_POLL_INTERVAL_MS) {
-      console.log("⏱️ Zurück auf normales Intervall:", BASE_POLL_INTERVAL_MS, "ms");
-    }
-    currentInterval = BASE_POLL_INTERVAL_MS;
-  } catch (err) {
-    const msg = String(err.message || err);
 
-    if (msg.includes("RATE_LIMIT_429")) {
-      console.error("⚠️ ForexFactory Rate Limit (429) erreicht! Warte jetzt 5 Minuten...");
-      currentInterval = COOLDOWN_INTERVAL_MS;
-    } else {
-      console.error("❌ Fehler in loop()/checkUsdNews():", err);
-      // Bei anderen Fehlern lassen wir das Intervall gleich, damit er weiter versucht
-    }
-  }
+def parse_event_time(date_str: str) -> datetime:
+    """Parst das Datum aus dem JSON nach UTC."""
+    # Beispiel: "2025-11-20T13:30:00.000Z"
+    if date_str.endswith("Z"):
+        date_str = date_str.replace("Z", "+00:00")
+    return datetime.fromisoformat(date_str).astimezone(timezone.utc)
 
-  // Nächsten Durchlauf planen
-  setTimeout(loop, currentInterval);
-}
 
-// Beim Start direkt einmal ausführen
-loop();
+def get_usd_high_events(events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Filtert alle USD High-Impact-News heraus und hängt ein Datumsobjekt an."""
+    result: List[Dict[str, Any]] = []
+    for e in events:
+        try:
+            if e.get("country") != "USD":
+                continue
+
+            impact_raw = str(e.get("impact", "")).lower()
+            # je nach API: "High", "high", oder 3
+            if impact_raw not in ("high", "3"):
+                continue
+
+            e["_dt"] = parse_event_time(e["date"])
+            result.append(e)
+        except Exception:
+            # wenn ein Eintrag spinnt, einfach ignorieren
+            continue
+
+    return result
+
+
+def process_events(usd_high_events: List[Dict[str, Any]]) -> datetime | None:
+    """
+    Sendet neue Events an Discord und gibt die Zeit des nächsten
+    zukünftigen USD-High-Impact-Events zurück.
+    """
+    now = datetime.now(timezone.utc)
+    next_future_time: datetime | None = None
+
+    for event in usd_high_events:
+        try:
+            event_time: datetime = event["_dt"]
+            title = event.get("title", "Unbekanntes Event")
+
+            # Key zur Erkennung von Duplikaten
+            key = f"{event.get('country')}|{title}|{event.get('date')}"
+
+            # Nur senden, wenn Zeit erreicht/vergangen & noch nicht gesendet
+            if event_time <= now and key not in sent_events:
+                sent_events.add(key)
+
+                forecast = event.get("forecast")
+                previous = event.get("previous")
+                impact = event.get("impact")
+
+                text_lines = [
+                    "📣 **USD News (High Impact)**",
+                    f"**{title}**",
+                    f"🕒 Zeit (UTC): `{event_time.isoformat()}`",
+                    f"📊 Impact: {impact}",
+                ]
+                if forecast:
+                    text_lines.append(f"🔮 Forecast: {forecast}")
+                if previous:
+                    text_lines.append(f"📁 Previous: {previous}")
+
+                content = "\n".join(text_lines)
+                send_discord_message(content)
+
+            # Merke nächstes Event in der Zukunft (für Sleep-Berechnung)
+            if event_time > now and (next_future_time is None or event_time < next_future_time):
+                next_future_time = event_time
+
+        except Exception as e:
+            logger.error("Fehler bei Event-Verarbeitung: %s", e)
+
+    return next_future_time
+
+
+# ======================================================
+#                 HAUPT-LOOP
+# ======================================================
+
+def main() -> None:
+    poll_interval = BASE_POLL_INTERVAL
+
+    while True:
+        try:
+            logger.info("🔎 Prüfe USD High-Impact News ...")
+
+            events = fetch_calendar()
+            usd_high_events = get_usd_high_events(events)
+
+            next_time = process_events(usd_high_events)
+            logger.info("✅ High-Impact-Check abgeschlossen.")
+
+            # Polling-Intervall je nach nächstem Event anpassen
+            if next_time:
+                now = datetime.now(timezone.utc)
+                diff = (next_time - now).total_seconds()
+
+                # je nach Abstand zum nächsten Event schlafen wir länger oder kürzer
+                if diff > 60 * 60:          # > 1h
+                    poll_interval = min(MAX_POLL_INTERVAL, 10 * 60)
+                elif diff > 10 * 60:        # 10–60min
+                    poll_interval = 5 * 60
+                elif diff > 60:             # 1–10min
+                    poll_interval = 60
+                else:                       # < 1min
+                    poll_interval = 30
+            else:
+                # keine zukünftigen Events -> wir können lange schlafen
+                poll_interval = MAX_POLL_INTERVAL
+
+        except RateLimitError as e:
+            # Wenn ForexFactory uns sagt wie lange wir warten sollen -> halten wir uns dran
+            if e.retry_after:
+                poll_interval = max(e.retry_after, BASE_POLL_INTERVAL)
+            else:
+                # Exponentielles Backoff, aber mit Obergrenze
+                poll_interval = min(poll_interval * 2, MAX_POLL_INTERVAL)
+
+            logger.warning(
+                "⚠️ Rate Limit erreicht. Warte %s Sekunden ...", poll_interval
+            )
+
+        except Exception as e:
+            # Unerwartete Fehler nur loggen, damit der Loop weiterläuft
+            logger.error("❌ Unerwarteter Fehler im Loop: %s", e)
+
+        logger.info("⏱️ Schlafe %s Sekunden ...", poll_interval)
+        time.sleep(poll_interval)
+
+
+if __name__ == "__main__":
+    main()
